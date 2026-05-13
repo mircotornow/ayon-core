@@ -1,6 +1,7 @@
 import os
 import re
 import copy
+from pathlib import Path
 import clique
 import pyblish.api
 
@@ -9,6 +10,7 @@ from ayon_core.pipeline import (
     get_temp_dir
 )
 from ayon_core.pipeline.publish.lib import get_default_reviewable_layers
+import ayon_api
 from ayon_core.pipeline.colorspace import get_representation_ocio_config_path
 from ayon_core.lib import is_oiio_supported
 
@@ -102,6 +104,13 @@ class ExtractOIIOTranscode(publish.Extractor):
         )
         project_settings = instance.context.data["project_settings"]
         review_layers = get_default_reviewable_layers(project_settings)
+
+        ################
+        folder_path = instance.data.get("folderPath")
+        project = os.environ["AYON_PROJECT_NAME"]
+        folder = ayon_api.get_folder_by_path(project, folder_path)
+        ###############
+
         for idx, repre in enumerate(list(repres)):
             self.log.debug("repre ({}): `{}`".format(idx + 1, repre["name"]))
             if not self._repre_is_valid(repre, profile):
@@ -183,6 +192,123 @@ class ExtractOIIOTranscode(publish.Extractor):
 
                 additional_command_args = (output_def["oiiotool_args"]
                                            ["additional_command_args"])
+
+                #==================
+                # Get lens for shot
+                #==================
+                # https://regex101.com/r/Dn0fpI/1
+                pattern = r"\{(?:(?P<link>\w+)\[(?P<type>[^\]]+)\]|(?P<sep>\|))\}"
+
+                undistort_path = None
+
+                resolved_command_args = []
+                data = {}
+                for arg in additional_command_args:
+                    matches = []
+                    index = 0
+                    for match in re.finditer(pattern, arg):
+                        if match.group("sep"):
+                            # This handles the {|} part
+                            index -= 1
+                        else:
+                            # This handles the {link[type]} part
+                            link_val = match.group("link")
+                            type_val = match.group("type")
+
+                            try:
+                                matches[index]
+                            except IndexError:
+                                matches.append([])
+
+                            matches[index].append((link_val, type_val))
+
+                            index += 1
+
+                    if not matches:
+                        resolved_command_args.append(arg)
+                        continue
+
+                    for match_alternatives in matches:
+                        for match in match_alternatives:
+                            link, image_type = match
+
+                            link = ayon_api.get_folder_links(
+                                project_name=project,
+                                folder_id=folder["id"],
+                                link_types=[link],
+                            )[0]
+
+                            if not link:
+                                continue
+
+                            product = ayon_api.get_product_by_name(project, image_type, folder_id=link["entityId"])
+                            if not product:
+                                continue
+
+                            versions = list(ayon_api.get_versions(project, product_ids=[product["id"]]))
+                            versions.sort(key=lambda v: v["version"])
+                            latest_version = versions[-1]
+                            latest_version_id = latest_version["id"]
+
+                            representations = ayon_api.get_representations(
+                                project,
+                                version_ids=[latest_version_id],
+                                fields=["name", "files"]
+                            )
+                            undistort_path = ""
+                            for representation in representations:
+                                if representation["name"] != "exr":
+                                    continue
+
+                                self.log.warning(latest_version)
+
+                                undistort_path = representation["files"][0]["path"]
+                                SOURCE_W = 3424
+                                SOURCE_H = 2202
+
+                                width = latest_version["attrib"]["resolutionWidth"]
+                                height = latest_version["attrib"]["resolutionHeight"]
+
+                                # Calculate the required offsets to keep it centered
+                                # We use // for integer division to avoid decimals
+                                off_x = (width - SOURCE_W) // 2
+                                off_y = (height - SOURCE_H) // 2
+
+                                data.update({
+                                    "width": width,
+                                    "height": height,
+                                    "offset_x": off_x,
+                                    "offset_y": off_y
+                                })
+
+                            if not undistort_path:
+                                continue
+
+                            undistort_path = Path(undistort_path.replace("{root[work]}", os.getenv("AYON_PROJECT_ROOT_WORK")))
+
+                            if not undistort_path.exists():
+                                raise RuntimeError("undistorted path: %s is not on disk!" %  undistort_path)
+
+                            resolved_command_args.append(str(undistort_path))
+
+                if data:
+                    # Apply to arguments
+                    final_args = []
+                    for arg in resolved_command_args:
+                        if isinstance(arg, str) and "{" in arg:
+                            try:
+                                # This will turn "--fullsize 3424x2202+{offset_x}+{offset_y}"
+                                # into "--fullsize 3424x2202+205+132" automatically
+                                formatted_arg = arg.format(**data)
+                                final_args.append(formatted_arg)
+                            except KeyError:
+                                final_args.append(arg)
+                        else:
+                            final_args.append(arg)
+
+                    additional_command_args = final_args
+                else:
+                    additional_command_args = resolved_command_args
 
                 sequence_files = self._translate_to_sequence(
                     files_to_convert)
