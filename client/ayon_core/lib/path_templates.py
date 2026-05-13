@@ -555,6 +555,9 @@ class FormattingPart:
 
     Containt only single key to format e.g. "{project[name]}".
 
+    Required key fallbacks are supported with `|`, for example
+    ``{root[publish]|root[work]}``. The first resolvable key is used.
+
     Args:
         field_name (str): Name of key.
         format_spec (str): Format specification.
@@ -641,26 +644,61 @@ class FormattingPart:
         joined_keys = "".join([f"[{key}]" for key in keys])
         return f"{template_base}{joined_keys}"
 
-    def keys(self) -> tuple[str]:
+    @staticmethod
+    def split_field_name_alternatives(field_name: str) -> list[str]:
+        """Split key alternatives separated by top-level `|`.
+
+        Example:
+            ``root[publish]|root[work]`` ->
+            ``["root[publish]", "root[work]"]``
+        """
+        mapping = dict(zip("({[", ")}]"))
+        opening = set(mapping.keys())
+        closing = set(mapping.values())
+
+        alternatives = []
+        current = ""
+        queue = []
+        for char in field_name:
+            if char in opening:
+                queue.append(mapping[char])
+                current += char
+                continue
+
+            if char in closing:
+                if queue and char == queue[-1]:
+                    queue.pop()
+                current += char
+                continue
+
+            if char == "|" and not queue:
+                alternatives.append(current)
+                current = ""
+                continue
+
+            current += char
+
+        alternatives.append(current)
+        return alternatives
+
+    def keys(self, field_name: Optional[str] = None) -> tuple[str]:
         """Return keys of the template.
 
         Returns:
             tuple[str]: Keys of the template.
 
         """
-        return tuple(SUB_DICT_PATTERN.findall(self._field_name))
+        if field_name is None:
+            field_name = self._field_name
+        return tuple(SUB_DICT_PATTERN.findall(field_name))
 
-    def format(
-        self, data: dict[str, Any], result: TemplatePartResult
+    def _format_single_field(
+        self,
+        field_name: str,
+        data: dict[str, Any],
     ) -> TemplatePartResult:
-        """Format the formattings string.
-
-        Args:
-            data(dict): Data that should be used for formatting.
-            result(TemplatePartResult): Object where result is stored.
-
-        """
-        key = self._template_base
+        result = TemplatePartResult()
+        key = f"{field_name}{self._format_spec}{self._conversion}"
 
         # ensure key is properly formed [({})] properly closed.
         if not self.validate_key_is_matched(key):
@@ -668,8 +706,11 @@ class FormattingPart:
             result.add_output(self.template)
             return result
 
-        # check if key expects subdictionary keys (e.g. project[name])
-        key_subdict = self.keys()
+        key_subdict = self.keys(field_name)
+        if not key_subdict:
+            result.add_missing_key(field_name)
+            result.add_output(self.template)
+            return result
 
         value = data
         missing_key = False
@@ -716,16 +757,16 @@ class FormattingPart:
             used_keys.append(sub_key)
             value = value.get(sub_key)
 
-        field_name = key_subdict[0]
+        used_field_name = key_subdict[0]
         if used_keys:
-            field_name = self.keys_to_template_base(used_keys)
+            used_field_name = self.keys_to_template_base(used_keys)
 
         if missing_key or invalid_type:
             if missing_key:
-                result.add_missing_key(field_name)
+                result.add_missing_key(used_field_name)
 
             elif invalid_type:
-                result.add_invalid_type(field_name, value)
+                result.add_invalid_type(used_field_name, value)
 
             result.add_output(self.template)
             return result
@@ -759,7 +800,7 @@ class FormattingPart:
         if not value_filled:
             parent_fill_data[used_keys[-1]] = value
 
-        template = f"{{{field_name}{self._format_spec}{self._conversion}}}"
+        template = f"{{{used_field_name}{self._format_spec}{self._conversion}}}"
         formatted_value = template.format(**root_fill_data)
         used_key = key
         if keys_to_value is not None:
@@ -775,11 +816,73 @@ class FormattingPart:
         result.add_output(formatted_value)
         return result
 
+    def get_template_for_data(self, data: dict[str, Any]) -> tuple[bool, str]:
+        """Return template placeholder of first resolvable key alternative."""
+        for field_name in self.split_field_name_alternatives(self._field_name):
+            data_v = data
+            for key in self.keys(field_name):
+                if isinstance(data_v, list):
+                    if not key.lstrip("-").isdigit():
+                        data_v = None
+                        break
+
+                    index = int(key)
+                    if index < 0:
+                        index = len(data_v) + index
+
+                    if not 0 <= index < len(data_v):
+                        data_v = None
+                        break
+
+                    data_v = data_v[index]
+                    continue
+
+                if not hasattr(data_v, "items") or key not in data_v:
+                    data_v = None
+                    break
+                try:
+                    data_v = data_v[key]
+                except (KeyError, IndexError, TypeError):
+                    data_v = None
+                    break
+
+            if data_v is not None:
+                template = f"{{{field_name}{self._format_spec}{self._conversion}}}"
+                return True, template
+        return False, ""
+
+    def format(
+        self, data: dict[str, Any], result: TemplatePartResult
+    ) -> TemplatePartResult:
+        """Format the formattings string.
+
+        Args:
+            data(dict): Data that should be used for formatting.
+            result(TemplatePartResult): Object where result is stored.
+
+        """
+        failed_result = None
+        for field_name in self.split_field_name_alternatives(self._field_name):
+            new_result = self._format_single_field(field_name, data)
+            if new_result.solved:
+                result.add_output(new_result)
+                return result
+
+            if failed_result is None:
+                failed_result = new_result
+
+        if failed_result is not None:
+            result.add_output(failed_result)
+        return result
+
 
 class OptionalPart:
     """Template part which contains optional formatting strings.
 
     If this part can't be filled the result is empty string.
+
+    Optional parts can also define fallbacks using the ``|`` separator,
+    for example ``<{root[publish]}|{root[work]}>``.
 
     Args:
         parts(list): Parts of template. Can contain 'str', 'OptionalPart' or
@@ -792,6 +895,73 @@ class OptionalPart:
     ):
         self._parts: list[Union[str, OptionalPart, FormattingPart]] = parts
 
+    @staticmethod
+    def _split_into_branches(
+        parts: list[Union[str, OptionalPart, FormattingPart]]
+    ) -> list[list[Union[str, OptionalPart, FormattingPart]]]:
+        """Split optional-part tokens into `|` separated branch lists.
+
+        The parser stores optional text as a flat list of strings and nested
+        parts. This helper converts the flat representation into branch groups
+        so formatting can try each alternative independently.
+        """
+        branches: list[list[Union[str, OptionalPart, FormattingPart]]] = [[]]
+        for part in parts:
+            if isinstance(part, str):
+                split_parts = part.split("|")
+                branches[-1].append(split_parts[0])
+                for split_part in split_parts[1:]:
+                    branches.append([split_part])
+                continue
+
+            branches[-1].append(part)
+
+        return branches
+
+    @classmethod
+    def _format_branch(
+        cls,
+        parts: list[Union[str, OptionalPart, FormattingPart]],
+        data: dict[str, Any],
+    ) -> TemplatePartResult:
+        """Format a single optional branch and return its result state."""
+        branch_result = TemplatePartResult(True)
+        for part in parts:
+            if isinstance(part, str):
+                branch_result.add_output(part)
+            else:
+                part.format(data, branch_result)
+        return branch_result
+
+    @classmethod
+    def _remove_branch_optional_parts_for_data(
+        cls,
+        parts: list[Union[str, OptionalPart, FormattingPart]],
+        data: dict[str, Any],
+    ) -> tuple[bool, str]:
+        """Resolve one optional branch to template text for available data.
+
+        Returns:
+            tuple[bool, str]: A pair containing whether the branch can be kept
+                and the branch text to emit when it can.
+        """
+        output = ""
+        for part in parts:
+            if isinstance(part, str):
+                output += part
+            elif isinstance(part, OptionalPart):
+                output += part.remove_optional_parts_for_data(data)
+            elif isinstance(part, FormattingPart):
+                solved, template = part.get_template_for_data(data)
+                if not solved:
+                    return False, ""
+                output += template
+            else:
+                raise TypeError(
+                    f"Got invalid type in template parts '{type(part)}'"
+                )
+        return True, output
+
     @property
     def parts(self) -> list[Union[str, OptionalPart, FormattingPart]]:
         return self._parts
@@ -800,29 +970,14 @@ class OptionalPart:
         if not data:
             return ""
 
-        output = ""
-        for part in self._parts:
-            if isinstance(part, str):
-                output += part
-            elif isinstance(part, OptionalPart):
-                output += part.remove_optional_parts_for_data(data)
-
-            elif isinstance(part, FormattingPart):
-                data_v = data
-                for key in part.keys():
-                    if key not in data_v:
-                        return ""
-                    try:
-                        data_v = data_v[key]
-                    except (KeyError, IndexError, TypeError):
-                        return ""
-                output += part.template
-
-            else:
-                raise TypeError(
-                    f"Got invalid type in template parts '{type(part)}'"
-                )
-        return output
+        for branch_parts in self._split_into_branches(self._parts):
+            solved, output = self._remove_branch_optional_parts_for_data(
+                branch_parts,
+                data,
+            )
+            if solved:
+                return output
+        return ""
 
     def __str__(self) -> str:
         joined_parts = "".join([str(p) for p in self._parts])
@@ -837,13 +992,9 @@ class OptionalPart:
         data: dict[str, Any],
         result: TemplatePartResult,
     ) -> TemplatePartResult:
-        new_result = TemplatePartResult(True)
-        for part in self._parts:
-            if isinstance(part, str):
-                new_result.add_output(part)
-            else:
-                part.format(data, new_result)
-
-        if new_result.solved:
-            result.add_output(new_result)
+        for branch_parts in self._split_into_branches(self._parts):
+            new_result = self._format_branch(branch_parts, data)
+            if new_result.solved:
+                result.add_output(new_result)
+                break
         return result

@@ -22,6 +22,27 @@ from ayon_core.lib.transcoding import (
 from ayon_core.lib.profiles_filtering import filter_profiles
 
 
+# Simple helper: repeatedly replace plain-name placeholders like {name}
+# with values from `data`, even if they appear inside other braces.
+# This intentionally does NOT evaluate arithmetic expressions — it only
+# substitutes simple identifiers. Example:
+#   '{856*{pixel_aspect}}x550' -> '{856*1.5}x550'
+def format_with_expressions(template, data):
+    name_pattern = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
+    prev = None
+    result = template
+    while prev != result:
+        prev = result
+        def _repl_name(m):
+            key = m.group(1)
+            if key in data:
+                val = data[key]
+                return str(val)
+            return m.group(0)
+        result = name_pattern.sub(_repl_name, result)
+    return result
+
+
 class ExtractOIIOTranscode(publish.Extractor):
     """
     Extractor to convert colors from one colorspace to different.
@@ -278,7 +299,7 @@ class ExtractOIIOTranscode(publish.Extractor):
                                     "width": width,
                                     "height": height,
                                     "offset_x": off_x,
-                                    "offset_y": off_y
+                                    "offset_y": off_y,
                                 })
 
                             if not undistort_path:
@@ -291,17 +312,24 @@ class ExtractOIIOTranscode(publish.Extractor):
 
                             resolved_command_args.append(str(undistort_path))
 
+                data.update({
+                    "pixel_aspect": folder["attrib"]["pixelAspect"],
+                })
+
                 if data:
                     # Apply to arguments
                     final_args = []
                     for arg in resolved_command_args:
                         if isinstance(arg, str) and "{" in arg:
                             try:
-                                # This will turn "--fullsize 3424x2202+{offset_x}+{offset_y}"
-                                # into "--fullsize 3424x2202+205+132" automatically
-                                formatted_arg = arg.format(**data)
+                                # Replace inner placeholders and evaluate simple
+                                # arithmetic expressions while keeping outer
+                                # structure intact. This handles cases like
+                                # '{856*{pixel_aspect}}x550'.
+                                formatted_arg = format_with_expressions(arg, data)
                                 final_args.append(formatted_arg)
-                            except KeyError:
+                            except Exception:
+                                # Fallback to original argument on any error
                                 final_args.append(arg)
                         else:
                             final_args.append(arg)
